@@ -396,7 +396,65 @@ def prepare_openwakeword_assets(wake_word: str, inference_framework: str) -> dic
         "wake_model": str(wake_model_path),
         "melspec_model": str(melspec_path),
         "embedding_model": str(embedding_path),
+        "framework": inference_framework,
     }
+
+
+def instantiate_openwakeword_model(assets: dict[str, str], vad_threshold: float = 0.0) -> WakeWordModel:
+    attempts: list[tuple[str, bool, dict[str, object]]] = [
+        (
+            "positional+framework",
+            False,
+            {
+                "vad_threshold": vad_threshold,
+                "inference_framework": assets["framework"],
+                "melspec_model_path": assets["melspec_model"],
+                "embedding_model_path": assets["embedding_model"],
+            },
+        ),
+        (
+            "positional-no-framework",
+            False,
+            {
+                "vad_threshold": vad_threshold,
+                "melspec_model_path": assets["melspec_model"],
+                "embedding_model_path": assets["embedding_model"],
+            },
+        ),
+        (
+            "keyword+framework",
+            True,
+            {
+                "wakeword_models": [assets["wake_model"]],
+                "vad_threshold": vad_threshold,
+                "inference_framework": assets["framework"],
+                "melspec_model_path": assets["melspec_model"],
+                "embedding_model_path": assets["embedding_model"],
+            },
+        ),
+        (
+            "keyword-no-framework",
+            True,
+            {
+                "wakeword_models": [assets["wake_model"]],
+                "vad_threshold": vad_threshold,
+                "melspec_model_path": assets["melspec_model"],
+                "embedding_model_path": assets["embedding_model"],
+            },
+        ),
+    ]
+
+    last_error: Optional[Exception] = None
+    for label, keyword_only, kwargs in attempts:
+        try:
+            if keyword_only:
+                return WakeWordModel(**kwargs)
+            return WakeWordModel([assets["wake_model"]], **kwargs)
+        except Exception as exc:
+            last_error = exc
+            logging.debug("openWakeWord Init-Versuch '%s' fehlgeschlagen: %s", label, exc)
+
+    raise RuntimeError(f"Konnte openWakeWord-Modell nicht initialisieren: {last_error}")
 
 
 class MicrophoneReader(threading.Thread):
@@ -884,41 +942,15 @@ class VoiceAssistant:
         self.current_recording_threshold = float(config.silence_threshold)
 
     def _load_wake_model(self) -> WakeWordModel:
-        framework = self.config.wakeword_inference_framework
-        try:
-            assets = prepare_openwakeword_assets(self.config.wake_word, framework)
-            model = WakeWordModel(
-                [assets["wake_model"]],
-                vad_threshold=0.0,
-                inference_framework=framework,
-                melspec_model_path=assets["melspec_model"],
-                embedding_model_path=assets["embedding_model"],
-            )
-            logging.info(
-                "openWakeWord geladen: wake_word=%s, framework=%s, model_path=%s",
-                self.config.wake_word,
-                framework,
-                assets["wake_model"],
-            )
-            return model
-        except Exception as first_exc:
-            logging.warning("Wake-Word-Laden mit %s fehlgeschlagen: %s", framework, first_exc)
-            fallback_framework = "onnx" if framework != "onnx" else "tflite"
-            assets = prepare_openwakeword_assets(self.config.wake_word, fallback_framework)
-            model = WakeWordModel(
-                [assets["wake_model"]],
-                vad_threshold=0.0,
-                inference_framework=fallback_framework,
-                melspec_model_path=assets["melspec_model"],
-                embedding_model_path=assets["embedding_model"],
-            )
-            logging.info(
-                "openWakeWord Fallback geladen: wake_word=%s, framework=%s, model_path=%s",
-                self.config.wake_word,
-                fallback_framework,
-                assets["wake_model"],
-            )
-            return model
+        assets = prepare_openwakeword_assets(self.config.wake_word, "onnx")
+        model = instantiate_openwakeword_model(assets, vad_threshold=0.0)
+        logging.info(
+            "openWakeWord geladen: wake_word=%s, framework=%s, model_path=%s",
+            self.config.wake_word,
+            assets["framework"],
+            assets["wake_model"],
+        )
+        return model
 
     def run(self) -> None:
         logging.info("Starte Assistent. Wake-Word: '%s'", self.config.wake_word)
