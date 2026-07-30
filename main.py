@@ -34,6 +34,7 @@ Startbeispiele:
 
 Hinweise:
 - Das Wake-Word ist standardmäßig "alexa" via openWakeWord.
+- openWakeWord läuft standardmäßig im ONNX-Modus für bessere Kompatibilität auf dem Pi.
 - faster-whisper läuft standardmäßig mit Modell "tiny", device="cpu", compute_type="int8".
 - Piper wird lokal geladen und streamt Satz für Satz zur Audioausgabe.
 - g4f nutzt mehrere Fallback-Provider, sofern im installierten g4f verfügbar.
@@ -76,8 +77,8 @@ except ImportError:  # ältere piper-tts Versionen
 class AssistantConfig:
     wake_word: str = "alexa"
     wake_threshold: float = 0.5
-    openwakeword_vad_threshold: float = 0.45
-    wakeword_inference_framework: str = "tflite"
+    openwakeword_vad_threshold: float = 0.0
+    wakeword_inference_framework: str = "onnx"
 
     mic_rate: int = 16000
     engine_rate: int = 16000
@@ -366,8 +367,6 @@ def prepare_openwakeword_assets(wake_word: str, inference_framework: str) -> dic
 
     melspec_name = f"melspectrogram{extension}"
     embedding_name = f"embedding_model{extension}"
-    vad_name = "silero_vad.onnx"
-
     melspec_path = download_file_if_missing(
         f"{OPENWAKEWORD_RELEASE_BASE_URL}/{melspec_name}",
         model_dir / melspec_name,
@@ -375,10 +374,6 @@ def prepare_openwakeword_assets(wake_word: str, inference_framework: str) -> dic
     embedding_path = download_file_if_missing(
         f"{OPENWAKEWORD_RELEASE_BASE_URL}/{embedding_name}",
         model_dir / embedding_name,
-    )
-    vad_path = download_file_if_missing(
-        f"{OPENWAKEWORD_RELEASE_BASE_URL}/{vad_name}",
-        model_dir / vad_name,
     )
 
     if candidate.is_file():
@@ -401,19 +396,7 @@ def prepare_openwakeword_assets(wake_word: str, inference_framework: str) -> dic
         "wake_model": str(wake_model_path),
         "melspec_model": str(melspec_path),
         "embedding_model": str(embedding_path),
-        "vad_model": str(vad_path),
     }
-
-
-def install_openwakeword_vad_override(vad_model_path: str) -> None:
-    import openwakeword
-    from openwakeword.vad import VAD as OriginalVAD
-
-    class LocalVAD(OriginalVAD):
-        def __init__(self, model_path: str = vad_model_path, n_threads: int = 1):
-            super().__init__(model_path=model_path, n_threads=n_threads)
-
-    openwakeword.VAD = LocalVAD
 
 
 class MicrophoneReader(threading.Thread):
@@ -904,10 +887,9 @@ class VoiceAssistant:
         framework = self.config.wakeword_inference_framework
         try:
             assets = prepare_openwakeword_assets(self.config.wake_word, framework)
-            install_openwakeword_vad_override(assets["vad_model"])
             model = WakeWordModel(
                 [assets["wake_model"]],
-                vad_threshold=self.config.openwakeword_vad_threshold,
+                vad_threshold=0.0,
                 inference_framework=framework,
                 melspec_model_path=assets["melspec_model"],
                 embedding_model_path=assets["embedding_model"],
@@ -923,10 +905,9 @@ class VoiceAssistant:
             logging.warning("Wake-Word-Laden mit %s fehlgeschlagen: %s", framework, first_exc)
             fallback_framework = "onnx" if framework != "onnx" else "tflite"
             assets = prepare_openwakeword_assets(self.config.wake_word, fallback_framework)
-            install_openwakeword_vad_override(assets["vad_model"])
             model = WakeWordModel(
                 [assets["wake_model"]],
-                vad_threshold=self.config.openwakeword_vad_threshold,
+                vad_threshold=0.0,
                 inference_framework=fallback_framework,
                 melspec_model_path=assets["melspec_model"],
                 embedding_model_path=assets["embedding_model"],
