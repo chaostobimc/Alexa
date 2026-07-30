@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import logging
 import os
 import queue
@@ -367,6 +368,7 @@ def prepare_openwakeword_assets(wake_word: str, inference_framework: str) -> dic
 
     melspec_name = f"melspectrogram{extension}"
     embedding_name = f"embedding_model{extension}"
+    vad_name = "silero_vad.onnx"
     melspec_path = download_file_if_missing(
         f"{OPENWAKEWORD_RELEASE_BASE_URL}/{melspec_name}",
         model_dir / melspec_name,
@@ -374,6 +376,10 @@ def prepare_openwakeword_assets(wake_word: str, inference_framework: str) -> dic
     embedding_path = download_file_if_missing(
         f"{OPENWAKEWORD_RELEASE_BASE_URL}/{embedding_name}",
         model_dir / embedding_name,
+    )
+    vad_path = download_file_if_missing(
+        f"{OPENWAKEWORD_RELEASE_BASE_URL}/{vad_name}",
+        model_dir / vad_name,
     )
 
     if candidate.is_file():
@@ -396,60 +402,78 @@ def prepare_openwakeword_assets(wake_word: str, inference_framework: str) -> dic
         "wake_model": str(wake_model_path),
         "melspec_model": str(melspec_path),
         "embedding_model": str(embedding_path),
+        "vad_model": str(vad_path),
         "framework": inference_framework,
     }
 
 
+def install_openwakeword_resources(assets: dict[str, str]) -> None:
+    import openwakeword
+
+    package_dir = Path(openwakeword.__file__).resolve().parent
+    resource_dir = package_dir / "resources" / "models"
+    resource_dir.mkdir(parents=True, exist_ok=True)
+
+    for key in ("melspec_model", "embedding_model", "vad_model"):
+        src = Path(assets[key])
+        dst = resource_dir / src.name
+        if not dst.exists() or dst.stat().st_size != src.stat().st_size:
+            shutil.copy2(src, dst)
+
+
 def instantiate_openwakeword_model(assets: dict[str, str], vad_threshold: float = 0.0) -> WakeWordModel:
-    attempts: list[tuple[str, bool, dict[str, object]]] = [
-        (
-            "positional+framework",
-            False,
-            {
-                "vad_threshold": vad_threshold,
-                "inference_framework": assets["framework"],
-                "melspec_model_path": assets["melspec_model"],
-                "embedding_model_path": assets["embedding_model"],
-            },
-        ),
-        (
-            "positional-no-framework",
-            False,
-            {
-                "vad_threshold": vad_threshold,
-                "melspec_model_path": assets["melspec_model"],
-                "embedding_model_path": assets["embedding_model"],
-            },
-        ),
-        (
-            "keyword+framework",
-            True,
-            {
-                "wakeword_models": [assets["wake_model"]],
-                "vad_threshold": vad_threshold,
-                "inference_framework": assets["framework"],
-                "melspec_model_path": assets["melspec_model"],
-                "embedding_model_path": assets["embedding_model"],
-            },
-        ),
-        (
-            "keyword-no-framework",
-            True,
-            {
-                "wakeword_models": [assets["wake_model"]],
-                "vad_threshold": vad_threshold,
-                "melspec_model_path": assets["melspec_model"],
-                "embedding_model_path": assets["embedding_model"],
-            },
-        ),
-    ]
+    install_openwakeword_resources(assets)
+
+    init_sig = inspect.signature(WakeWordModel.__init__)
+    params = init_sig.parameters
+    supported = set(params.keys())
+
+    base_kwargs: dict[str, object] = {}
+    if "vad_threshold" in supported:
+        base_kwargs["vad_threshold"] = vad_threshold
+    if "inference_framework" in supported:
+        base_kwargs["inference_framework"] = assets["framework"]
+
+    keyword_names = [name for name in ("wakeword_models", "wakeword_model_paths", "wakeword_model") if name in supported]
+    positional_supported = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params.values()) or len(params) > 1
+
+    attempts: list[tuple[str, Callable[[], WakeWordModel]]] = []
+
+    if positional_supported:
+        attempts.append(
+            (
+                "positional-list",
+                lambda: WakeWordModel([assets["wake_model"]], **base_kwargs),
+            )
+        )
+        attempts.append(
+            (
+                "positional-string",
+                lambda: WakeWordModel(assets["wake_model"], **base_kwargs),
+            )
+        )
+
+    for keyword_name in keyword_names:
+        attempts.append(
+            (
+                f"keyword-list:{keyword_name}",
+                lambda keyword_name=keyword_name: WakeWordModel(**{keyword_name: [assets['wake_model']], **base_kwargs}),
+            )
+        )
+        attempts.append(
+            (
+                f"keyword-string:{keyword_name}",
+                lambda keyword_name=keyword_name: WakeWordModel(**{keyword_name: assets['wake_model'], **base_kwargs}),
+            )
+        )
+
+    if not attempts:
+        attempts.append(("bare-positional", lambda: WakeWordModel([assets["wake_model"]])))
 
     last_error: Optional[Exception] = None
-    for label, keyword_only, kwargs in attempts:
+    for label, factory in attempts:
         try:
-            if keyword_only:
-                return WakeWordModel(**kwargs)
-            return WakeWordModel([assets["wake_model"]], **kwargs)
+            return factory()
         except Exception as exc:
             last_error = exc
             logging.debug("openWakeWord Init-Versuch '%s' fehlgeschlagen: %s", label, exc)
