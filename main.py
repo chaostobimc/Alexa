@@ -330,6 +330,50 @@ def resolve_piper_model_path(model_arg: str, data_dir: str) -> Path:
     )
 
 
+def resolve_openwakeword_model_path(wake_word: str, inference_framework: str) -> str:
+    import openwakeword
+    from openwakeword import utils as oww_utils
+
+    candidate = Path(wake_word).expanduser()
+    if candidate.is_file():
+        return str(candidate.resolve())
+
+    normalized = wake_word.strip().lower().replace(" ", "_")
+    available_models = getattr(openwakeword, "MODELS", {})
+
+    model_info = available_models.get(normalized)
+    if model_info is None:
+        matching_keys = [key for key in available_models if normalized in key]
+        if len(matching_keys) == 1:
+            normalized = matching_keys[0]
+            model_info = available_models[normalized]
+
+    if model_info is None:
+        available = ", ".join(sorted(available_models.keys())) or "<keine>"
+        raise FileNotFoundError(
+            f"Wake-Word-Modell '{wake_word}' wurde in openWakeWord nicht gefunden. "
+            f"Verfügbare Modelle: {available}"
+        )
+
+    model_path = Path(model_info["model_path"])
+    if inference_framework == "onnx":
+        model_path = model_path.with_suffix(".onnx")
+
+    if not model_path.exists():
+        logging.info("openWakeWord-Modell '%s' fehlt lokal, lade es herunter...", normalized)
+        try:
+            oww_utils.download_models([normalized], target_directory=str(model_path.parent))
+        except TypeError:
+            oww_utils.download_models([normalized])
+
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"Wake-Word-Modell '{normalized}' konnte nicht bereitgestellt werden: {model_path}"
+        )
+
+    return str(model_path.resolve())
+
+
 class MicrophoneReader(threading.Thread):
     def __init__(self, config: AssistantConfig, out_queue: queue.Queue[np.ndarray], stop_event: threading.Event) -> None:
         super().__init__(name="MicrophoneReader", daemon=True)
@@ -815,30 +859,35 @@ class VoiceAssistant:
         self.current_recording_threshold = float(config.silence_threshold)
 
     def _load_wake_model(self) -> WakeWordModel:
+        framework = self.config.wakeword_inference_framework
         try:
+            model_path = resolve_openwakeword_model_path(self.config.wake_word, framework)
             model = WakeWordModel(
-                [self.config.wake_word],
+                [model_path],
                 vad_threshold=self.config.openwakeword_vad_threshold,
-                inference_framework=self.config.wakeword_inference_framework,
+                inference_framework=framework,
             )
             logging.info(
-                "openWakeWord geladen: wake_word=%s, framework=%s",
+                "openWakeWord geladen: wake_word=%s, framework=%s, model_path=%s",
                 self.config.wake_word,
-                self.config.wakeword_inference_framework,
+                framework,
+                model_path,
             )
             return model
         except Exception as first_exc:
-            logging.warning("Wake-Word-Laden mit %s fehlgeschlagen: %s", self.config.wakeword_inference_framework, first_exc)
-            fallback_framework = "onnx" if self.config.wakeword_inference_framework != "onnx" else "tflite"
+            logging.warning("Wake-Word-Laden mit %s fehlgeschlagen: %s", framework, first_exc)
+            fallback_framework = "onnx" if framework != "onnx" else "tflite"
+            model_path = resolve_openwakeword_model_path(self.config.wake_word, fallback_framework)
             model = WakeWordModel(
-                [self.config.wake_word],
+                [model_path],
                 vad_threshold=self.config.openwakeword_vad_threshold,
                 inference_framework=fallback_framework,
             )
             logging.info(
-                "openWakeWord Fallback geladen: wake_word=%s, framework=%s",
+                "openWakeWord Fallback geladen: wake_word=%s, framework=%s, model_path=%s",
                 self.config.wake_word,
                 fallback_framework,
+                model_path,
             )
             return model
 
