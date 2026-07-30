@@ -47,11 +47,13 @@ import logging
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.request
 import wave
 from collections import deque
 from dataclasses import dataclass
@@ -206,6 +208,17 @@ class PCMResampler:
         return resample_int16_pcm(pcm_bytes, self.src_rate, self.dst_rate, self.channels)
 
 
+OPENWAKEWORD_RELEASE_BASE_URL = "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1"
+OPENWAKEWORD_MODEL_STEMS = {
+    "alexa": "alexa_v0.1",
+    "hey_mycroft": "hey_mycroft_v0.1",
+    "hey_jarvis": "hey_jarvis_v0.1",
+    "hey_rhasspy": "hey_rhasspy_v0.1",
+    "timer": "timer_v0.1",
+    "weather": "weather_v0.1",
+}
+
+
 class SentenceChunker:
     SENTENCE_END_RE = re.compile(r"(.+?[.!?…]+[\"'”»\])}]*)(?=\s+|$)|(.+?[.!?…]+)(?=\s+|$)", re.S)
 
@@ -330,48 +343,77 @@ def resolve_piper_model_path(model_arg: str, data_dir: str) -> Path:
     )
 
 
-def resolve_openwakeword_model_path(wake_word: str, inference_framework: str) -> str:
-    import openwakeword
-    from openwakeword import utils as oww_utils
+def download_file_if_missing(url: str, destination: Path) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() and destination.stat().st_size > 0:
+        return destination
 
+    tmp_path = destination.with_suffix(destination.suffix + ".part")
+    logging.info("Lade herunter: %s -> %s", url, destination)
+    with urllib.request.urlopen(url, timeout=60) as response, open(tmp_path, "wb") as out_file:
+        shutil.copyfileobj(response, out_file)
+    tmp_path.replace(destination)
+    return destination
+
+
+def prepare_openwakeword_assets(wake_word: str, inference_framework: str) -> dict[str, str]:
     candidate = Path(wake_word).expanduser()
-    if candidate.is_file():
-        return str(candidate.resolve())
-
     normalized = wake_word.strip().lower().replace(" ", "_")
-    available_models = getattr(openwakeword, "MODELS", {})
+    extension = ".onnx" if inference_framework == "onnx" else ".tflite"
 
-    model_info = available_models.get(normalized)
-    if model_info is None:
-        matching_keys = [key for key in available_models if normalized in key]
-        if len(matching_keys) == 1:
-            normalized = matching_keys[0]
-            model_info = available_models[normalized]
+    cache_dir = Path(".cache/openwakeword").resolve()
+    model_dir = cache_dir / "models"
 
-    if model_info is None:
-        available = ", ".join(sorted(available_models.keys())) or "<keine>"
-        raise FileNotFoundError(
-            f"Wake-Word-Modell '{wake_word}' wurde in openWakeWord nicht gefunden. "
-            f"Verfügbare Modelle: {available}"
+    melspec_name = f"melspectrogram{extension}"
+    embedding_name = f"embedding_model{extension}"
+    vad_name = "silero_vad.onnx"
+
+    melspec_path = download_file_if_missing(
+        f"{OPENWAKEWORD_RELEASE_BASE_URL}/{melspec_name}",
+        model_dir / melspec_name,
+    )
+    embedding_path = download_file_if_missing(
+        f"{OPENWAKEWORD_RELEASE_BASE_URL}/{embedding_name}",
+        model_dir / embedding_name,
+    )
+    vad_path = download_file_if_missing(
+        f"{OPENWAKEWORD_RELEASE_BASE_URL}/{vad_name}",
+        model_dir / vad_name,
+    )
+
+    if candidate.is_file():
+        wake_model_path = candidate.resolve()
+    else:
+        stem = OPENWAKEWORD_MODEL_STEMS.get(normalized)
+        if not stem:
+            available = ", ".join(sorted(OPENWAKEWORD_MODEL_STEMS.keys()))
+            raise FileNotFoundError(
+                f"Wake-Word-Modell '{wake_word}' wird von diesem Skript nicht unterstützt. "
+                f"Verfügbare integrierte Modelle: {available}"
+            )
+        filename = f"{stem}{extension}"
+        wake_model_path = download_file_if_missing(
+            f"{OPENWAKEWORD_RELEASE_BASE_URL}/{filename}",
+            model_dir / filename,
         )
 
-    model_path = Path(model_info["model_path"])
-    if inference_framework == "onnx":
-        model_path = model_path.with_suffix(".onnx")
+    return {
+        "wake_model": str(wake_model_path),
+        "melspec_model": str(melspec_path),
+        "embedding_model": str(embedding_path),
+        "vad_model": str(vad_path),
+    }
 
-    if not model_path.exists():
-        logging.info("openWakeWord-Modell '%s' fehlt lokal, lade es herunter...", normalized)
-        try:
-            oww_utils.download_models([normalized], target_directory=str(model_path.parent))
-        except TypeError:
-            oww_utils.download_models([normalized])
 
-    if not model_path.exists():
-        raise FileNotFoundError(
-            f"Wake-Word-Modell '{normalized}' konnte nicht bereitgestellt werden: {model_path}"
-        )
+def install_openwakeword_vad_override(vad_model_path: str) -> None:
+    import openwakeword
+    from openwakeword.vad import VAD as OriginalVAD
 
-    return str(model_path.resolve())
+    class LocalVAD(OriginalVAD):
+        def __init__(self, model_path: str = vad_model_path, n_threads: int = 1):
+            super().__init__(model_path=model_path, n_threads=n_threads)
+
+    openwakeword.VAD = LocalVAD
 
 
 class MicrophoneReader(threading.Thread):
@@ -861,33 +903,39 @@ class VoiceAssistant:
     def _load_wake_model(self) -> WakeWordModel:
         framework = self.config.wakeword_inference_framework
         try:
-            model_path = resolve_openwakeword_model_path(self.config.wake_word, framework)
+            assets = prepare_openwakeword_assets(self.config.wake_word, framework)
+            install_openwakeword_vad_override(assets["vad_model"])
             model = WakeWordModel(
-                [model_path],
+                [assets["wake_model"]],
                 vad_threshold=self.config.openwakeword_vad_threshold,
                 inference_framework=framework,
+                melspec_model_path=assets["melspec_model"],
+                embedding_model_path=assets["embedding_model"],
             )
             logging.info(
                 "openWakeWord geladen: wake_word=%s, framework=%s, model_path=%s",
                 self.config.wake_word,
                 framework,
-                model_path,
+                assets["wake_model"],
             )
             return model
         except Exception as first_exc:
             logging.warning("Wake-Word-Laden mit %s fehlgeschlagen: %s", framework, first_exc)
             fallback_framework = "onnx" if framework != "onnx" else "tflite"
-            model_path = resolve_openwakeword_model_path(self.config.wake_word, fallback_framework)
+            assets = prepare_openwakeword_assets(self.config.wake_word, fallback_framework)
+            install_openwakeword_vad_override(assets["vad_model"])
             model = WakeWordModel(
-                [model_path],
+                [assets["wake_model"]],
                 vad_threshold=self.config.openwakeword_vad_threshold,
                 inference_framework=fallback_framework,
+                melspec_model_path=assets["melspec_model"],
+                embedding_model_path=assets["embedding_model"],
             )
             logging.info(
                 "openWakeWord Fallback geladen: wake_word=%s, framework=%s, model_path=%s",
                 self.config.wake_word,
                 fallback_framework,
-                model_path,
+                assets["wake_model"],
             )
             return model
 
