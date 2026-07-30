@@ -7,5 +7,5 @@ openwakeword
 ai-edge-litert
 onnxruntime
 faster-whisper
-g4f[all]
+g4f
 piper-tts

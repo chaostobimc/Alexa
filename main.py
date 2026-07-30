@@ -15,7 +15,7 @@ Installation (Raspberry Pi OS / Debian Bookworm, Python 3.11+ empfohlen):
     pip install --upgrade pip wheel setuptools
     pip install \
         numpy pyaudio openwakeword ai-edge-litert onnxruntime \
-        faster-whisper g4f[all] piper-tts
+        faster-whisper g4f piper-tts
 
 Piper-Stimme herunterladen (Deutsch, empfohlen):
 
@@ -43,7 +43,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import audioop
 import logging
 import os
 import queue
@@ -148,29 +147,63 @@ class TTSTask:
     stop: bool = False
 
 
+def pcm_rms_int16(pcm_bytes: bytes, channels: int = 1) -> float:
+    if not pcm_bytes:
+        return 0.0
+    samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+    if samples.size == 0:
+        return 0.0
+    if channels > 1:
+        samples = samples.reshape(-1, channels).mean(axis=1)
+    samples_f = samples.astype(np.float32)
+    return float(np.sqrt(np.mean(samples_f * samples_f)))
+
+
+def resample_int16_pcm(pcm_bytes: bytes, src_rate: int, dst_rate: int, channels: int = 1) -> bytes:
+    if src_rate == dst_rate or not pcm_bytes:
+        return pcm_bytes
+
+    if channels < 1:
+        raise ValueError("channels muss >= 1 sein")
+
+    samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+    if samples.size == 0:
+        return pcm_bytes
+
+    if samples.size % channels != 0:
+        raise ValueError("PCM-Daten passen nicht zur Kanalzahl")
+
+    frames = samples.reshape(-1, channels).astype(np.float32)
+    src_len = frames.shape[0]
+    dst_len = max(1, int(round(src_len * dst_rate / src_rate)))
+
+    if src_len == 1:
+        out = np.repeat(frames, dst_len, axis=0)
+    else:
+        x_src = np.arange(src_len, dtype=np.float32)
+        x_dst = np.linspace(0, src_len - 1, num=dst_len, dtype=np.float32)
+        out = np.empty((dst_len, channels), dtype=np.float32)
+        for ch in range(channels):
+            out[:, ch] = np.interp(x_dst, x_src, frames[:, ch])
+
+    out = np.clip(np.rint(out), -32768, 32767).astype(np.int16)
+    return out.tobytes()
+
+
 class PCMResampler:
     def __init__(self, src_rate: int, dst_rate: int, sample_width: int = 2, channels: int = 1) -> None:
         self.src_rate = src_rate
         self.dst_rate = dst_rate
         self.sample_width = sample_width
         self.channels = channels
-        self._state = None
 
     def reset(self) -> None:
-        self._state = None
+        return None
 
     def process(self, pcm_bytes: bytes) -> bytes:
-        if self.src_rate == self.dst_rate:
-            return pcm_bytes
-        converted, self._state = audioop.ratecv(
-            pcm_bytes,
-            self.sample_width,
-            self.channels,
-            self.src_rate,
-            self.dst_rate,
-            self._state,
-        )
-        return converted
+        if self.sample_width != 2:
+            raise ValueError("Dieses Skript unterstützt nur 16-bit PCM Audio")
+        return resample_int16_pcm(pcm_bytes, self.src_rate, self.dst_rate, self.channels)
 
 
 class SentenceChunker:
@@ -406,9 +439,6 @@ class AudioOutput:
             self._play_with_aplay(chunks)
 
     def _play_with_pyaudio(self, chunks: Iterable[object]) -> None:
-        resample_state = None
-        source_rate_for_state = None
-
         for chunk in chunks:
             raw = getattr(chunk, "audio_int16_bytes")
             src_rate = int(getattr(chunk, "sample_rate", 22050))
@@ -416,14 +446,10 @@ class AudioOutput:
             channels = int(getattr(chunk, "sample_channels", 1))
             out_rate = self.config.tts_output_rate or src_rate
 
+            if sample_width != 2:
+                raise RuntimeError(f"Nur 16-bit PCM wird unterstützt, bekam {sample_width * 8} bit")
             if out_rate != src_rate:
-                if source_rate_for_state != src_rate:
-                    resample_state = None
-                    source_rate_for_state = src_rate
-                raw, resample_state = audioop.ratecv(raw, sample_width, channels, src_rate, out_rate, resample_state)
-            else:
-                resample_state = None
-                source_rate_for_state = None
+                raw = resample_int16_pcm(raw, src_rate, out_rate, channels)
 
             self._ensure_output_stream(out_rate, channels, sample_width)
             assert self._stream is not None
@@ -431,8 +457,6 @@ class AudioOutput:
 
     def _play_with_aplay(self, chunks: Iterable[object]) -> None:
         proc: Optional[subprocess.Popen[bytes]] = None
-        resample_state = None
-        source_rate_for_state = None
 
         try:
             for chunk in chunks:
@@ -446,13 +470,7 @@ class AudioOutput:
                     raise RuntimeError(f"aplay-Fallback erwartet 16-bit PCM, bekam {sample_width * 8} bit")
 
                 if out_rate != src_rate:
-                    if source_rate_for_state != src_rate:
-                        resample_state = None
-                        source_rate_for_state = src_rate
-                    raw, resample_state = audioop.ratecv(raw, sample_width, channels, src_rate, out_rate, resample_state)
-                else:
-                    resample_state = None
-                    source_rate_for_state = None
+                    raw = resample_int16_pcm(raw, src_rate, out_rate, channels)
 
                 if proc is None:
                     cmd = [
@@ -858,7 +876,7 @@ class VoiceAssistant:
             self.tts_worker.join(timeout=5)
 
     def _process_frame(self, frame: np.ndarray) -> None:
-        rms = float(audioop.rms(frame.tobytes(), 2))
+        rms = pcm_rms_int16(frame.tobytes(), self.config.channels)
         self._update_noise_floor(rms)
 
         if self.state == "recording":
