@@ -817,7 +817,7 @@ class VoiceAssistant:
     def _load_wake_model(self) -> WakeWordModel:
         try:
             model = WakeWordModel(
-                wakeword_models=[self.config.wake_word],
+                [self.config.wake_word],
                 vad_threshold=self.config.openwakeword_vad_threshold,
                 inference_framework=self.config.wakeword_inference_framework,
             )
@@ -831,7 +831,7 @@ class VoiceAssistant:
             logging.warning("Wake-Word-Laden mit %s fehlgeschlagen: %s", self.config.wakeword_inference_framework, first_exc)
             fallback_framework = "onnx" if self.config.wakeword_inference_framework != "onnx" else "tflite"
             model = WakeWordModel(
-                wakeword_models=[self.config.wake_word],
+                [self.config.wake_word],
                 vad_threshold=self.config.openwakeword_vad_threshold,
                 inference_framework=fallback_framework,
             )
