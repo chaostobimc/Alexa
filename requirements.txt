@@ -1,0 +1,11 @@
+# Python-Abhängigkeiten für main.py
+# Systempakete (apt) siehe Kommentarblock am Anfang von main.py.
+
+numpy
+PyAudio
+openwakeword
+ai-edge-litert
+onnxruntime
+faster-whisper
+g4f[all]
+piper-tts
